@@ -15,6 +15,7 @@ namespace Kapuctagram.Sdk
         private bool _isAuthenticated;
 
         public event Func<ChatMessage, Task> OnMessageReceived;
+        public event Func<long, Task> OnNewChat;  // уведомление о новом чате
 
         public async Task ConnectAsync(string host, int port)
         {
@@ -97,17 +98,26 @@ namespace Kapuctagram.Sdk
                         await OnUserChatsReceived.Invoke(chatIds);
                     break;
 
+                case 'N':
+                    if (long.TryParse(raw.Data, out long newChatId))
+                    {
+                        if (OnNewChat != null)
+                            await OnNewChat.Invoke(newChatId);
+                    }
+                    break;
+
                 case 'C':
                 case 'J':
                 case 'I':
                 case 'K':
                 case 'U':
+                case 'H':
                     break;
             }
         }
-        
+
         public event Func<List<long>, Task> OnUserChatsReceived;
-        
+
         public async Task<List<long>> GetUserChatsAsync()
         {
             if (!_isAuthenticated) throw new InvalidOperationException("Not authenticated");
@@ -125,7 +135,7 @@ namespace Kapuctagram.Sdk
             await _connection.SendMessageAsync('S', "");
             return await tcs.Task;
         }
-        
+
         public async Task<ChatInfo> CreateChatAsync(string type, string name, string password, string targetUserId = null)
         {
             if (!_isAuthenticated) throw new InvalidOperationException("Not authenticated");
@@ -152,7 +162,7 @@ namespace Kapuctagram.Sdk
             await _connection.SendMessageAsync('C', data);
             return await tcs.Task;
         }
-        
+
         public async Task JoinChatAsync(long chatId)
         {
             if (!_isAuthenticated) throw new InvalidOperationException("Not authenticated");
@@ -170,19 +180,19 @@ namespace Kapuctagram.Sdk
             await _connection.SendMessageAsync('J', chatId.ToString());
             await tcs.Task;
         }
-        
+
         public async Task LeaveChatAsync(long chatId)
         {
             if (!_isAuthenticated) throw new InvalidOperationException("Not authenticated");
             await _connection.SendMessageAsync('L', chatId.ToString());
         }
-        
+
         public async Task SendMessageToChatAsync(long chatId, string text)
         {
             if (!_isAuthenticated) throw new InvalidOperationException("Not authenticated");
             await _connection.SendMessageAsync('M', $"{chatId}|{text}");
         }
-        
+
         public async Task SendFileToChatAsync(long chatId, string filePath)
         {
             if (!_isAuthenticated) throw new InvalidOperationException("Not authenticated");
@@ -195,7 +205,7 @@ namespace Kapuctagram.Sdk
             await _connection.SendMessageAsync('F', header);
             await _connection.SendFileContentAsync(filePath);
         }
-        
+
         public async Task<ChatInfo> GetChatInfoAsync(long chatId)
         {
             if (!_isAuthenticated) throw new InvalidOperationException("Not authenticated");
@@ -228,7 +238,7 @@ namespace Kapuctagram.Sdk
             await _connection.SendMessageAsync('I', chatId.ToString());
             return await tcs.Task;
         }
-        
+
         public async Task<List<SearchResult>> SearchAsync(string query)
         {
             if (!_isAuthenticated) throw new InvalidOperationException("Not authenticated");
@@ -262,42 +272,75 @@ namespace Kapuctagram.Sdk
             await _connection.SendMessageAsync('Q', query);
             return await tcs.Task;
         }
-        
+
+        public async Task<List<string>> GetChatHistoryAsync(long chatId, int count = 50)
+        {
+            if (!_isAuthenticated) throw new InvalidOperationException("Not authenticated");
+            var tcs = new TaskCompletionSource<List<string>>();
+            async Task Handler((char Type, string Data) raw)
+            {
+                if (raw.Type == 'H')
+                {
+                    int firstPipe = raw.Data.IndexOf('|');
+                    if (firstPipe >= 0 && long.TryParse(raw.Data.Substring(0, firstPipe), out long returnedChatId) && returnedChatId == chatId)
+                    {
+                        string historyPart = raw.Data.Substring(firstPipe + 1);
+                        var messages = historyPart.Split('\n', StringSplitOptions.RemoveEmptyEntries).ToList();
+                        tcs.TrySetResult(messages);
+                    }
+                    else
+                    {
+                        tcs.TrySetResult(new List<string>());
+                    }
+                    _connection.OnMessageReceived -= Handler;
+                }
+            }
+            _connection.OnMessageReceived += Handler;
+            await _connection.SendMessageAsync('H', $"{chatId}|{count}");
+            return await tcs.Task;
+        }
+
         public async Task UpdateChatSettingsAsync(long chatId, string newName, string newPassword)
         {
             if (!_isAuthenticated) throw new InvalidOperationException("Not authenticated");
             await _connection.SendMessageAsync('U', $"{chatId}|{newName}|{newPassword}");
         }
-        
+
         public async Task BanUserAsync(long chatId, long userId)
         {
             if (!_isAuthenticated) throw new InvalidOperationException("Not authenticated");
             await _connection.SendMessageAsync('K', $"{chatId}|{userId}|ban");
         }
-        
+
         public async Task UnbanUserAsync(long chatId, long userId)
         {
             if (!_isAuthenticated) throw new InvalidOperationException("Not authenticated");
             await _connection.SendMessageAsync('K', $"{chatId}|{userId}|unban");
         }
-        
+
         public async Task AddAdminAsync(long chatId, long userId)
         {
             if (!_isAuthenticated) throw new InvalidOperationException("Not authenticated");
             await _connection.SendMessageAsync('K', $"{chatId}|{userId}|makeAdmin");
         }
-        
+
         public async Task RemoveAdminAsync(long chatId, long userId)
         {
             if (!_isAuthenticated) throw new InvalidOperationException("Not authenticated");
             await _connection.SendMessageAsync('K', $"{chatId}|{userId}|removeAdmin");
         }
-        
+
+        public async Task DownloadFileAsync(long chatId, long fileId, string saveFilePath)
+        {
+            if (!_isAuthenticated) throw new InvalidOperationException("Not authenticated");
+            await _connection.DownloadFileAsync(chatId, fileId, saveFilePath);
+        }
+
         [Obsolete("Use SendMessageToChatAsync instead")]
-        public async Task SendTextAsync(string text) {  }
+        public async Task SendTextAsync(string text) { }
 
         [Obsolete("Use SendFileToChatAsync instead")]
-        public async Task SendFileAsync(string filePath) {  }
+        public async Task SendFileAsync(string filePath) { }
 
         public void Dispose()
         {
