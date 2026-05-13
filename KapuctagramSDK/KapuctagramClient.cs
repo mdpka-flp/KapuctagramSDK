@@ -112,6 +112,7 @@ namespace Kapuctagram.Sdk
                 case 'K':
                 case 'U':
                 case 'H':
+                case 'E':
                     break;
             }
         }

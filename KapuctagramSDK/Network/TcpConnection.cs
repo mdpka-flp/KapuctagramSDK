@@ -15,8 +15,9 @@ namespace Kapuctagram.Sdk.Network
         private bool _disposed;
         
         private readonly SemaphoreSlim _writeLock = new SemaphoreSlim(1, 1);
-        private readonly SemaphoreSlim _receiveLock = new SemaphoreSlim(1, 1);
-        private bool _receiveEnabled = true;
+        //private readonly SemaphoreSlim _receiveLock = new SemaphoreSlim(1, 1);
+        //private bool _receiveEnabled = true;
+        private readonly SemaphoreSlim _readLock = new SemaphoreSlim(1, 1);
 
         public event Func<(char Type, string Data), Task> OnMessageReceived;
 
@@ -57,56 +58,52 @@ namespace Kapuctagram.Sdk.Network
                 _writeLock.Release();
             }
         }
-
-        public async Task DownloadFileAsync(long chatId, long fileId, string saveFilePath)
-        {
-            // Запрещаем фоновому циклу читать сообщения на время скачивания
-            await _receiveLock.WaitAsync();
-            _receiveEnabled = false;
-            try
-            {
-                // 1. Отправляем запрос
+        
+        public async Task DownloadFileAsync(long chatId, long fileId, string saveFilePath) 
+        { 
+            await _readLock.WaitAsync(); 
+            try 
+            { 
                 await _writeLock.WaitAsync();
-                try
-                {
-                    await MessageParser.WriteMessageAsync(_stream, 'D', $"{chatId}|{fileId}");
-                }
-                finally
-                {
-                    _writeLock.Release();
-                }
-
-                // 2. Читаем ответ (должен быть 'D|OK|размер' или 'D|ERROR|...')
-                var (type, data) = await MessageParser.ReadMessageAsync(_stream);
-                if (type != 'D')
-                    throw new InvalidOperationException("Unexpected server response");
+                try { await MessageParser.WriteMessageAsync(_stream, 'D', $"{chatId}|{fileId}"); }
+                finally { _writeLock.Release(); }
                 
-                var parts = data.Split('|');
-                if (parts[0] == "ERROR")
-                    throw new Exception(parts[1]);
-                if (parts[0] != "OK" || !long.TryParse(parts[1], out long expectedSize))
-                    throw new Exception("Invalid file download response");
-
-                // 3. Читаем файл напрямую из потока
-                using var fs = new FileStream(saveFilePath, FileMode.Create, FileAccess.Write);
-                byte[] buffer = new byte[81920];
-                long totalRead = 0;
-                while (totalRead < expectedSize)
-                {
-                    int toRead = (int)Math.Min(buffer.Length, expectedSize - totalRead);
-                    int read = await _stream.ReadAsync(buffer, 0, toRead);
-                    if (read == 0) throw new EndOfStreamException("Connection lost while downloading");
-                    await fs.WriteAsync(buffer, 0, read);
-                    totalRead += read;
+                var (type, data) = await MessageParser.ReadMessageAsync(_stream); 
+                if (type != 'D') throw new InvalidOperationException("Unexpected server response");
+                
+                var parts = data.Split('|'); 
+                if (parts[0] == "ERROR") throw new Exception(parts[1]); 
+                if (parts[0] != "OK" || !long.TryParse(parts[1], out long expectedSize)) 
+                    throw new Exception("Invalid file download response"); 
+                { 
+                    
+                    using var fs = new FileStream(saveFilePath, FileMode.Create, FileAccess.Write,
+                        FileShare.Read, 81920, FileOptions.WriteThrough); 
+                    byte[] buffer = new byte[81920]; 
+                    long totalRead = 0;
+                    
+                    while (totalRead < expectedSize) 
+                    { 
+                        int toRead = (int)Math.Min(buffer.Length, expectedSize - totalRead); 
+                        int read = await _stream.ReadAsync(buffer, 0, toRead); 
+                        if (read == 0) throw new EndOfStreamException("Соединение разорвано при загрузке");
+                        
+                        await fs.WriteAsync(buffer, 0, read); 
+                        totalRead += read; 
+                    }
+                    
+                    if (totalRead != expectedSize) 
+                        throw new Exception($"Несоответствие размера: {totalRead}/{expectedSize}");
+                    
+                    fs.Flush(true); 
                 }
+                
+                var (endType, _) = await MessageParser.ReadMessageAsync(_stream); 
+                if (endType != 'E') throw new InvalidOperationException($"Ожидается 'E', получено '{endType}'"); 
             }
-            finally
-            {
-                _receiveEnabled = true;
-                _receiveLock.Release();
-            }
+            finally { _readLock.Release(); } 
         }
-
+        
         public void StartReceiving()
         {
             _ = Task.Run(ReceiveLoopAsync);
@@ -114,38 +111,26 @@ namespace Kapuctagram.Sdk.Network
 
         private async Task ReceiveLoopAsync()
         {
-            try
+            while (!_cts.IsCancellationRequested && _client.Connected)
             {
-                while (!_cts.IsCancellationRequested && _client.Connected)
+                try
                 {
-                    // Проверяем, разрешён ли приём (без захвата блокировки на всё время цикла)
-                    bool enabled;
-                    await _receiveLock.WaitAsync();
-                    enabled = _receiveEnabled;
-                    _receiveLock.Release();
-
-                    if (!enabled)
-                    {
-                        await Task.Delay(10);
-                        continue;
-                    }
-
-                    try
-                    {
-                        var (type, data) = await MessageParser.ReadMessageAsync(_stream);
-                        if (OnMessageReceived != null)
-                            await OnMessageReceived.Invoke((type, data));
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"ReceiveLoop error: {ex.Message}");
-                        await Task.Delay(100);
-                    }
+                    await _readLock.WaitAsync();
+                    var (type, data) = await MessageParser.ReadMessageAsync(_stream);
+                    _readLock.Release();
+            
+                    OnMessageReceived?.Invoke((type, data));
                 }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"ReceiveLoop fatal: {ex.Message}");
+                catch (Exception ex)
+                {
+                    if (_readLock.CurrentCount == 0) _readLock.Release();
+                    Console.WriteLine($"[FATAL] ReceiveLoop: {ex.Message}");
+            
+                    // ⛔ ПРИ ДЕСИНХРОНИЗАЦИИ ПОТОК БОЛЬШЕ НЕ НАДЁЖЕН. 
+                    // Продолжать чтение БЕСПОЛЕЗНО и ОПАСНО.
+                    _cts?.Cancel(); 
+                    break; // Выходим из цикла. Клиент должен переподключиться.
+                }
             }
         }
 
@@ -164,7 +149,8 @@ namespace Kapuctagram.Sdk.Network
             _stream?.Dispose();
             _client?.Dispose();
             _writeLock?.Dispose();
-            _receiveLock?.Dispose();
+            //_receiveLock?.Dispose();
+            _readLock?.Dispose();
         }
     }
 }
